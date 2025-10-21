@@ -1,25 +1,22 @@
-# app.py
+# app.py (المقاطع المهمة فقط لتحديث /split)
 import os
 import tempfile
 import subprocess
-import shutil
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
+import requests
 
-# -------- Config --------
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 BUCKET_DEFAULT = os.getenv("AUDIO_BUCKET", "audio-files")
-CHUNK_SECONDS_DEFAULT = int(os.getenv("CHUNK_SECONDS", "600"))  # 10 minutes
-AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "64k")    # audio bitrate
-AUDIO_CODEC = os.getenv("AUDIO_CODEC", "aac")        # codec for m4a container
-AUDIO_RATE = os.getenv("AUDIO_RATE", "16000")        # 16kHz
-AUDIO_CHANNELS = os.getenv("AUDIO_CHANNELS", "1")    # mono
-FFMPEG_PATH_ENV = os.getenv("FFMPEG_PATH", "")       # optional custom path
+CHUNK_SECONDS_DEFAULT = int(os.getenv("CHUNK_SECONDS", "600"))
+AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "64k")
+AUDIO_CODEC = os.getenv("AUDIO_CODEC", "aac")
+AUDIO_RATE = os.getenv("AUDIO_RATE", "16000")
+AUDIO_CHANNELS = os.getenv("AUDIO_CHANNELS", "1")
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
@@ -27,57 +24,22 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
 sb: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 app = FastAPI(title="Audio Splitter Service")
 
-# ---- CORS (مهم لاستدعاء الخدمة من أي مكان) ----
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
-)
-
 class SplitRequest(BaseModel):
     transcriptionId: str
-    storagePath: str                  # e.g., "uploads/meeting.m4a"
+    storagePath: str                  # "uploads/meeting.m4a" أو URL موقّع/عام
     bucket: Optional[str] = None      # default audio-files
     chunkSeconds: Optional[int] = None
-    # Optional prefix to place the chunks
     outputPrefix: Optional[str] = None  # e.g., "audio-chunks"
 
 class SplitResponse(BaseModel):
-    parts: List[str]                  # list of storage paths for chunks (in same bucket)
+    parts: List[str]
     bucket: str
     chunkSeconds: int
-    ffmpeg: Optional[str] = None      # info for debugging
 
-def find_ffmpeg() -> Tuple[str, str]:
-    """
-    Returns (path, version_string). Raises if not found.
-    """
-    # Priority: env override -> which -> common paths
-    candidates = []
-    if FFMPEG_PATH_ENV:
-        candidates.append(FFMPEG_PATH_ENV)
-    which = shutil.which("ffmpeg")
-    if which:
-        candidates.append(which)
-    candidates += ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/bin/ffmpeg"]
-
-    for c in candidates:
-        if c and os.path.isfile(c) and os.access(c, os.X_OK):
-            try:
-                ver = subprocess.run([c, "-version"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True, text=True, timeout=5)
-                return c, ver.stdout.strip().splitlines()[0]
-            except Exception as e:
-                continue
-    raise RuntimeError("ffmpeg not found. Set FFMPEG_PATH or install ffmpeg on the server.")
-
-def run_ffmpeg_split(ffmpeg_path: str, in_file: Path, out_dir: Path, chunk_seconds: int) -> List[Path]:
-    """
-    Transcode to consistent CBR and split by duration into valid .m4a chunks.
-    """
+def run_ffmpeg_split(in_file: Path, out_dir: Path, chunk_seconds: int) -> List[Path]:
     out_pattern = str(out_dir / "part_%03d.m4a")
     cmd = [
-        ffmpeg_path,
-        "-y",
+        "ffmpeg", "-y",
         "-i", str(in_file),
         "-ac", AUDIO_CHANNELS,
         "-ar", AUDIO_RATE,
@@ -89,93 +51,80 @@ def run_ffmpeg_split(ffmpeg_path: str, in_file: Path, out_dir: Path, chunk_secon
         out_pattern,
     ]
     try:
-        # اجمع stdout/stderr لتشخيص سريع
-        proc = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600)
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except subprocess.CalledProcessError as e:
-        tail = (e.stderr or b"").decode(errors="ignore")[-4000:]
+        tail = e.stderr.decode(errors="ignore")[-2000:]
         raise RuntimeError(f"ffmpeg failed: {tail}")
-    except subprocess.TimeoutExpired:
-        raise RuntimeError("ffmpeg timeout (600s). Try shorter chunkSeconds or check input format.")
 
     parts = sorted(out_dir.glob("part_*.m4a"))
     if not parts:
         raise RuntimeError("No chunks produced; check input format or ffmpeg install.")
     return parts
 
-@app.get("/health")
-def health():
-    try:
-        path, ver = find_ffmpeg()
-        return {"status": "ok", "ffmpeg": {"path": path, "version": ver}}
-    except Exception as e:
-        return {"status": "degraded", "error": str(e)}
+def _normalize_path(p: str) -> str:
+    # إزالة أي سلاش في البداية
+    return p.lstrip("/")
 
-@app.get("/ffmpeg-info")
-def ffmpeg_info():
+def _download_to_bytes(bucket: str, storage_path: str) -> bytes:
+    """
+    يدعم:
+    - مسار Supabase Storage عادي داخل bucket.
+    - أو storagePath يكون URL (عام/موقع) فيقوم بتنزيله عبر HTTP.
+    """
+    # لو URL
+    if storage_path.startswith("http://") or storage_path.startswith("https://"):
+        r = requests.get(storage_path, timeout=60)
+        if r.status_code != 200:
+            raise HTTPException(404, f"HTTP download failed: {r.status_code}")
+        return r.content
+
+    # لو مسار داخلي
+    storage_path = _normalize_path(storage_path)
     try:
-        path, ver = find_ffmpeg()
-        return {"path": path, "version": ver}
+        data = sb.storage.from_(bucket).download(storage_path)
     except Exception as e:
-        raise HTTPException(500, f"ffmpeg not available: {e}")
+        # ترجمة أخطاء Supabase لرسالة واضحة
+        raise HTTPException(404, f"Supabase download threw exception: {getattr(e, 'message', str(e))}")
+    if data is None:
+        raise HTTPException(404, "Supabase download returned None (object not found?)")
+    return data
 
 @app.post("/split", response_model=SplitResponse)
 def split_audio(req: SplitRequest):
     bucket = req.bucket or BUCKET_DEFAULT
     chunk_seconds = req.chunkSeconds or CHUNK_SECONDS_DEFAULT
-    output_prefix = req.outputPrefix or "audio-chunks"
+    output_prefix = (req.outputPrefix or "audio-chunks").strip().strip("/")
 
-    # 0) تأكد من ffmpeg
-    ffmpeg_path, ffmpeg_ver = find_ffmpeg()
-
-    # 1) Download from Supabase
+    # 1) تنزيل الملف
     try:
-        dl = sb.storage.from_(bucket).download(req.storagePath)
+        blob = _download_to_bytes(bucket, req.storagePath)
+    except HTTPException as http_e:
+        # نعيد نفس الرسالة للـ Edge
+        raise http_e
     except Exception as e:
-        raise HTTPException(500, f"Supabase download threw exception: {e}")
-
-    if dl is None:
-        raise HTTPException(404, f"File not found or access denied: bucket={bucket}, path={req.storagePath}")
+        raise HTTPException(500, f"Unexpected error during download: {str(e)}")
 
     with tempfile.TemporaryDirectory() as td:
         td_path = Path(td)
-        in_file = td_path / "input.any"
-        try:
-            in_file.write_bytes(dl)
-        except Exception as e:
-            raise HTTPException(500, f"Failed to write temp input: {e}")
+        in_file = td_path / "input_any"
+        in_file.write_bytes(blob)
 
-        # 2) Split with ffmpeg
+        # 2) تقسيم
         out_dir = td_path / "chunks"
         out_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            parts = run_ffmpeg_split(ffmpeg_path, in_file, out_dir, chunk_seconds)
-        except Exception as e:
-            raise HTTPException(500, f"{e}")
+        parts = run_ffmpeg_split(in_file, out_dir, chunk_seconds)
 
-        # 3) Upload chunks
+        # 3) رفع الناتج
         storage_paths: List[str] = []
         base_dir = f"{output_prefix}/{req.transcriptionId}"
         for p in parts:
-            rel_name = p.name  # part_000.m4a
+            rel_name = p.name
             remote_path = f"{base_dir}/{rel_name}"
-            try:
-                with p.open("rb") as fh:
-                    # upsert=True مهم إذا أعدت التشغيل
-                    res = sb.storage.from_(bucket).upload(
-                        remote_path, fh,
-                        {"content-type": "audio/mp4", "upsert": "true"}
-                    )
-            except Exception as e:
-                raise HTTPException(500, f"Supabase upload failed for {remote_path}: {e}")
-
+            with p.open("rb") as fh:
+                # m4a mime (aac) = audio/mp4
+                res = sb.storage.from_(bucket).upload(remote_path, fh, {"content-type": "audio/mp4"})
             if res is None:
-                raise HTTPException(500, f"Upload returned None for {remote_path}")
-
+                raise HTTPException(500, f"Failed to upload chunk {rel_name} to {bucket}/{remote_path}")
             storage_paths.append(remote_path)
 
-    return SplitResponse(
-        parts=storage_paths,
-        bucket=bucket,
-        chunkSeconds=chunk_seconds,
-        ffmpeg=ffmpeg_ver
-    )
+    return SplitResponse(parts=storage_paths, bucket=bucket, chunkSeconds=chunk_seconds)
