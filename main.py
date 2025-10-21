@@ -1,4 +1,3 @@
-# main.py
 import os
 import tempfile
 import subprocess
@@ -19,18 +18,14 @@ AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "64k")               # audio bitrate
 AUDIO_CODEC = os.getenv("AUDIO_CODEC", "aac")                   # m4a container (audio/mp4)
 AUDIO_RATE = os.getenv("AUDIO_RATE", "16000")                   # 16kHz
 AUDIO_CHANNELS = os.getenv("AUDIO_CHANNELS", "1")               # mono
-ROOT_PATH = os.getenv("ROOT_PATH", "").strip().strip("/")       # optional prefix, e.g. "api"
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
 
 sb: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
-# FastAPI app (support root_path if provided)
-app = FastAPI(
-    title="Audio Splitter Service",
-    root_path=f"/{ROOT_PATH}" if ROOT_PATH else "",
-)
+# -------- FastAPI app --------
+app = FastAPI(title="Audio Splitter Service")
 
 # CORS (allow all)
 app.add_middleware(
@@ -54,9 +49,7 @@ class SplitResponse(BaseModel):
 
 # -------- Helpers --------
 def run_ffmpeg_split(in_file: Path, out_dir: Path, chunk_seconds: int) -> List[Path]:
-    """
-    Transcode to consistent CBR AAC/m4a and split by duration into valid .m4a chunks.
-    """
+    """Transcode to consistent CBR AAC/m4a and split by duration."""
     out_pattern = str(out_dir / "part_%03d.m4a")
     cmd = [
         "ffmpeg", "-y",
@@ -85,55 +78,47 @@ def _normalize_path(p: str) -> str:
     return p.lstrip("/")
 
 def _download_to_bytes(bucket: str, storage_path: str) -> bytes:
-    """
-    - Supports direct URL (public/signed) via urllib
-    - Or internal Supabase Storage path via supabase-py
-    """
+    """Supports Supabase path or full public/signed URL."""
     storage_path = storage_path.strip()
 
-    # Download via URL
+    # 1) Direct URL
     if storage_path.startswith("http://") or storage_path.startswith("https://"):
         try:
             req = Request(storage_path, headers={"User-Agent": "Mozilla/5.0"})
             with urlopen(req, timeout=120) as resp:
-                status = getattr(resp, "status", 200)
-                if status != 200:
-                    raise HTTPException(404, f"HTTP download failed: {status}")
+                if getattr(resp, "status", 200) != 200:
+                    raise HTTPException(404, f"HTTP download failed: {resp.status}")
                 return resp.read()
-        except HTTPException:
-            raise
         except Exception as e:
-            raise HTTPException(404, f"HTTP download error: {str(e)}")
+            raise HTTPException(404, f"Download error: {str(e)}")
 
-    # Download from Supabase Storage
+    # 2) Supabase Storage
     storage_path = _normalize_path(storage_path)
     try:
         data = sb.storage.from_(bucket).download(storage_path)
     except Exception as e:
-        raise HTTPException(404, f"Supabase download threw exception: {getattr(e, 'message', str(e))}")
+        raise HTTPException(404, f"Supabase download exception: {getattr(e, 'message', str(e))}")
     if data is None:
-        raise HTTPException(404, "Supabase download returned None (object not found?)")
+        raise HTTPException(404, "File not found in Supabase storage.")
     return data
 
-# -------- Health & Debug Routes --------
+# -------- Routes --------
 @app.get("/healthz")
 def healthz():
-    return {"ok": True, "root_path": app.root_path or "/"}
+    return {"ok": True}
 
 @app.get("/routes")
 def list_routes():
     return {
-        "root_path": app.root_path or "/",
         "routes": sorted(
             [
-                {"path": r.path, "name": r.name, "methods": sorted(list(getattr(r, "methods", [])))}
+                {"path": r.path, "methods": sorted(list(getattr(r, "methods", [])))}
                 for r in app.routes
             ],
             key=lambda x: x["path"],
         ),
     }
 
-# -------- Main Split Endpoint --------
 @app.post("/split", response_model=SplitResponse)
 def split_audio(req: SplitRequest):
     bucket = req.bucket or BUCKET_DEFAULT
@@ -146,28 +131,28 @@ def split_audio(req: SplitRequest):
     except HTTPException as http_e:
         raise http_e
     except Exception as e:
-        raise HTTPException(500, f"Unexpected error during download: {str(e)}")
+        raise HTTPException(500, f"Unexpected download error: {str(e)}")
 
     with tempfile.TemporaryDirectory() as td:
         td_path = Path(td)
-        in_file = td_path / "input_any"
+        in_file = td_path / "input.m4a"
         in_file.write_bytes(blob)
 
-        # 2) Split with ffmpeg
+        # 2) Split file
         out_dir = td_path / "chunks"
         out_dir.mkdir(parents=True, exist_ok=True)
         parts = run_ffmpeg_split(in_file, out_dir, chunk_seconds)
 
-        # 3) Upload chunks
+        # 3) Upload chunks to Supabase
         storage_paths: List[str] = []
         base_dir = f"{output_prefix}/{req.transcriptionId}"
         for p in parts:
-            rel_name = p.name  # part_000.m4a
+            rel_name = p.name
             remote_path = f"{base_dir}/{rel_name}"
             with p.open("rb") as fh:
                 res = sb.storage.from_(bucket).upload(remote_path, fh, {"content-type": "audio/mp4"})
             if res is None:
-                raise HTTPException(500, f"Failed to upload chunk {rel_name} to {bucket}/{remote_path}")
+                raise HTTPException(500, f"Failed to upload chunk {rel_name}")
             storage_paths.append(remote_path)
 
     return SplitResponse(parts=storage_paths, bucket=bucket, chunkSeconds=chunk_seconds)
