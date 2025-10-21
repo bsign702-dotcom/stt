@@ -1,4 +1,4 @@
-# app.py
+# main.py
 import os
 import tempfile
 import subprocess
@@ -24,24 +24,25 @@ ROOT_PATH = os.getenv("ROOT_PATH", "").strip().strip("/")       # optional prefi
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
 
+sb: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
 # FastAPI app (support root_path if provided)
 app = FastAPI(
     title="Audio Splitter Service",
     root_path=f"/{ROOT_PATH}" if ROOT_PATH else "",
 )
 
-# CORS
+# CORS (allow all)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
 
-sb: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-
+# -------- Models --------
 class SplitRequest(BaseModel):
     transcriptionId: str
-    storagePath: str                  # "uploads/meeting.m4a" أو URL موقّع/عام
+    storagePath: str                  # "uploads/meeting.m4a" or signed/public URL
     bucket: Optional[str] = None      # default audio-files
     chunkSeconds: Optional[int] = None
     outputPrefix: Optional[str] = None  # e.g., "audio-chunks"
@@ -51,6 +52,7 @@ class SplitResponse(BaseModel):
     bucket: str
     chunkSeconds: int
 
+# -------- Helpers --------
 def run_ffmpeg_split(in_file: Path, out_dir: Path, chunk_seconds: int) -> List[Path]:
     """
     Transcode to consistent CBR AAC/m4a and split by duration into valid .m4a chunks.
@@ -84,12 +86,12 @@ def _normalize_path(p: str) -> str:
 
 def _download_to_bytes(bucket: str, storage_path: str) -> bytes:
     """
-    - يدعم URL (عام/موقّع) عبر urllib
-    - أو مسار داخلي في Supabase Storage عبر supabase-py
+    - Supports direct URL (public/signed) via urllib
+    - Or internal Supabase Storage path via supabase-py
     """
     storage_path = storage_path.strip()
 
-    # تنزيل عبر URL مباشر
+    # Download via URL
     if storage_path.startswith("http://") or storage_path.startswith("https://"):
         try:
             req = Request(storage_path, headers={"User-Agent": "Mozilla/5.0"})
@@ -103,7 +105,7 @@ def _download_to_bytes(bucket: str, storage_path: str) -> bytes:
         except Exception as e:
             raise HTTPException(404, f"HTTP download error: {str(e)}")
 
-    # تنزيل من Supabase Storage
+    # Download from Supabase Storage
     storage_path = _normalize_path(storage_path)
     try:
         data = sb.storage.from_(bucket).download(storage_path)
@@ -138,7 +140,7 @@ def split_audio(req: SplitRequest):
     chunk_seconds = req.chunkSeconds or CHUNK_SECONDS_DEFAULT
     output_prefix = (req.outputPrefix or "audio-chunks").strip().strip("/")
 
-    # 1) تنزيل الملف
+    # 1) Download source file
     try:
         blob = _download_to_bytes(bucket, req.storagePath)
     except HTTPException as http_e:
@@ -151,16 +153,16 @@ def split_audio(req: SplitRequest):
         in_file = td_path / "input_any"
         in_file.write_bytes(blob)
 
-        # 2) تقسيم
+        # 2) Split with ffmpeg
         out_dir = td_path / "chunks"
         out_dir.mkdir(parents=True, exist_ok=True)
         parts = run_ffmpeg_split(in_file, out_dir, chunk_seconds)
 
-        # 3) رفع الناتج
+        # 3) Upload chunks
         storage_paths: List[str] = []
         base_dir = f"{output_prefix}/{req.transcriptionId}"
         for p in parts:
-            rel_name = p.name
+            rel_name = p.name  # part_000.m4a
             remote_path = f"{base_dir}/{rel_name}"
             with p.open("rb") as fh:
                 res = sb.storage.from_(bucket).upload(remote_path, fh, {"content-type": "audio/mp4"})
