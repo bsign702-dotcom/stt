@@ -1,28 +1,37 @@
-# app.py (المقاطع المهمة فقط لتحديث /split)
+# app.py
 import os
 import tempfile
 import subprocess
 from pathlib import Path
 from typing import List, Optional
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client, Client
-import requests
+from urllib.request import urlopen, Request
 
+# -------- Config --------
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 BUCKET_DEFAULT = os.getenv("AUDIO_BUCKET", "audio-files")
-CHUNK_SECONDS_DEFAULT = int(os.getenv("CHUNK_SECONDS", "600"))
-AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "64k")
-AUDIO_CODEC = os.getenv("AUDIO_CODEC", "aac")
-AUDIO_RATE = os.getenv("AUDIO_RATE", "16000")
-AUDIO_CHANNELS = os.getenv("AUDIO_CHANNELS", "1")
+CHUNK_SECONDS_DEFAULT = int(os.getenv("CHUNK_SECONDS", "600"))  # 10 minutes
+AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "64k")               # audio bitrate
+AUDIO_CODEC = os.getenv("AUDIO_CODEC", "aac")                   # m4a = audio/mp4
+AUDIO_RATE = os.getenv("AUDIO_RATE", "16000")                   # 16kHz
+AUDIO_CHANNELS = os.getenv("AUDIO_CHANNELS", "1")               # mono
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
 
 sb: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 app = FastAPI(title="Audio Splitter Service")
+
+# CORS (اختياري - يسمح بالوصول من أي مصدر)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
+)
 
 class SplitRequest(BaseModel):
     transcriptionId: str
@@ -37,6 +46,9 @@ class SplitResponse(BaseModel):
     chunkSeconds: int
 
 def run_ffmpeg_split(in_file: Path, out_dir: Path, chunk_seconds: int) -> List[Path]:
+    """
+    Transcode to consistent CBR AAC/m4a and split by duration into valid .m4a chunks.
+    """
     out_pattern = str(out_dir / "part_%03d.m4a")
     cmd = [
         "ffmpeg", "-y",
@@ -62,28 +74,33 @@ def run_ffmpeg_split(in_file: Path, out_dir: Path, chunk_seconds: int) -> List[P
     return parts
 
 def _normalize_path(p: str) -> str:
-    # إزالة أي سلاش في البداية
     return p.lstrip("/")
 
 def _download_to_bytes(bucket: str, storage_path: str) -> bytes:
     """
-    يدعم:
-    - مسار Supabase Storage عادي داخل bucket.
-    - أو storagePath يكون URL (عام/موقع) فيقوم بتنزيله عبر HTTP.
+    - يدعم URL (عام/موقّع) عبر urllib
+    - أو مسار داخلي في Supabase Storage عبر supabase-py
     """
-    # لو URL
-    if storage_path.startswith("http://") or storage_path.startswith("https://"):
-        r = requests.get(storage_path, timeout=60)
-        if r.status_code != 200:
-            raise HTTPException(404, f"HTTP download failed: {r.status_code}")
-        return r.content
+    storage_path = storage_path.strip()
 
-    # لو مسار داخلي
+    # تنزيل عبر URL مباشر
+    if storage_path.startswith("http://") or storage_path.startswith("https://"):
+        try:
+            req = Request(storage_path, headers={"User-Agent": "Mozilla/5.0"})
+            with urlopen(req, timeout=120) as resp:
+                if getattr(resp, "status", 200) != 200:
+                    raise HTTPException(404, f"HTTP download failed: {getattr(resp, 'status', 'unknown')}")
+                return resp.read()
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(404, f"HTTP download error: {str(e)}")
+
+    # تنزيل من Supabase Storage
     storage_path = _normalize_path(storage_path)
     try:
         data = sb.storage.from_(bucket).download(storage_path)
     except Exception as e:
-        # ترجمة أخطاء Supabase لرسالة واضحة
         raise HTTPException(404, f"Supabase download threw exception: {getattr(e, 'message', str(e))}")
     if data is None:
         raise HTTPException(404, "Supabase download returned None (object not found?)")
@@ -99,7 +116,6 @@ def split_audio(req: SplitRequest):
     try:
         blob = _download_to_bytes(bucket, req.storagePath)
     except HTTPException as http_e:
-        # نعيد نفس الرسالة للـ Edge
         raise http_e
     except Exception as e:
         raise HTTPException(500, f"Unexpected error during download: {str(e)}")
@@ -120,8 +136,7 @@ def split_audio(req: SplitRequest):
         for p in parts:
             rel_name = p.name
             remote_path = f"{base_dir}/{rel_name}"
-            with p.open("rb") as fh:
-                # m4a mime (aac) = audio/mp4
+            with p.open("rb")as fh:
                 res = sb.storage.from_(bucket).upload(remote_path, fh, {"content-type": "audio/mp4"})
             if res is None:
                 raise HTTPException(500, f"Failed to upload chunk {rel_name} to {bucket}/{remote_path}")
