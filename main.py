@@ -16,22 +16,28 @@ SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 BUCKET_DEFAULT = os.getenv("AUDIO_BUCKET", "audio-files")
 CHUNK_SECONDS_DEFAULT = int(os.getenv("CHUNK_SECONDS", "600"))  # 10 minutes
 AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "64k")               # audio bitrate
-AUDIO_CODEC = os.getenv("AUDIO_CODEC", "aac")                   # m4a = audio/mp4
+AUDIO_CODEC = os.getenv("AUDIO_CODEC", "aac")                   # m4a container (audio/mp4)
 AUDIO_RATE = os.getenv("AUDIO_RATE", "16000")                   # 16kHz
 AUDIO_CHANNELS = os.getenv("AUDIO_CHANNELS", "1")               # mono
+ROOT_PATH = os.getenv("ROOT_PATH", "").strip().strip("/")       # optional prefix, e.g. "api"
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY")
 
-sb: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
-app = FastAPI(title="Audio Splitter Service")
+# FastAPI app (support root_path if provided)
+app = FastAPI(
+    title="Audio Splitter Service",
+    root_path=f"/{ROOT_PATH}" if ROOT_PATH else "",
+)
 
-# CORS (اختياري - يسمح بالوصول من أي مصدر)
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
+
+sb: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 class SplitRequest(BaseModel):
     transcriptionId: str
@@ -88,8 +94,9 @@ def _download_to_bytes(bucket: str, storage_path: str) -> bytes:
         try:
             req = Request(storage_path, headers={"User-Agent": "Mozilla/5.0"})
             with urlopen(req, timeout=120) as resp:
-                if getattr(resp, "status", 200) != 200:
-                    raise HTTPException(404, f"HTTP download failed: {getattr(resp, 'status', 'unknown')}")
+                status = getattr(resp, "status", 200)
+                if status != 200:
+                    raise HTTPException(404, f"HTTP download failed: {status}")
                 return resp.read()
         except HTTPException:
             raise
@@ -106,6 +113,25 @@ def _download_to_bytes(bucket: str, storage_path: str) -> bytes:
         raise HTTPException(404, "Supabase download returned None (object not found?)")
     return data
 
+# -------- Health & Debug Routes --------
+@app.get("/healthz")
+def healthz():
+    return {"ok": True, "root_path": app.root_path or "/"}
+
+@app.get("/routes")
+def list_routes():
+    return {
+        "root_path": app.root_path or "/",
+        "routes": sorted(
+            [
+                {"path": r.path, "name": r.name, "methods": sorted(list(getattr(r, "methods", [])))}
+                for r in app.routes
+            ],
+            key=lambda x: x["path"],
+        ),
+    }
+
+# -------- Main Split Endpoint --------
 @app.post("/split", response_model=SplitResponse)
 def split_audio(req: SplitRequest):
     bucket = req.bucket or BUCKET_DEFAULT
@@ -136,7 +162,7 @@ def split_audio(req: SplitRequest):
         for p in parts:
             rel_name = p.name
             remote_path = f"{base_dir}/{rel_name}"
-            with p.open("rb")as fh:
+            with p.open("rb") as fh:
                 res = sb.storage.from_(bucket).upload(remote_path, fh, {"content-type": "audio/mp4"})
             if res is None:
                 raise HTTPException(500, f"Failed to upload chunk {rel_name} to {bucket}/{remote_path}")
